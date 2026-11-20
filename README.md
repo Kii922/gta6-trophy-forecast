@@ -28,24 +28,36 @@ players play.
      `(earners_after - earners_before) / (players_after - players_before)`;
    - the between-refresh earners growth: the logit of each trophy's earn
      rate grows linearly in `ln(1 + hours)`, fitted inside the recent
-     stable windows, then shrunk (central factor 0.35) because the launch
+     stable windows, then shrunk (central factor 0.40) because the launch
      rush overstates how fast trophies keep being earned — every rate
-     saturates at its eventual popularity.
+     saturates at its eventual popularity. The fitted slope is further
+     scaled by the measured deceleration: the median over trophies of
+     (slope in the last 24h) / (slope in the 24h before it), clipped to
+     [0.25, 1.0]. A case whose growth is visibly fading gets its future
+     growth damped; a case whose growth is steady keeps the full slope.
+     The scenarios span 0.5x to 2x around the damped slope.
 3. Simulate forward from the last read to the target over a deterministic
    grid of 81 scenarios (interval × jump-decay × new-player earn rate ×
    growth rate). The five quantiles of each trophy are the weighted
    quantiles of its rate across the scenarios, so the fan is honest and
    horizon-scaled: narrow for a 90-minute practice case with a near-certain
-   refresh, wide for the 6,510-minute final.
+   refresh, wide for the 6,510-minute final. On top of the scenario spread
+   there is a horizon-scaled floor on the fan (0.2 logit wide at 90
+   minutes, 0.6 wide at 6,510 minutes): the scenario grid spans parameter
+   uncertainty, not the model's own error, and that error grows with the
+   horizon.
 
 When a case's history shows no refresh at all (the practice cases: the
 launch-night page, unchanged for hours), the refresh parameters fall back
 to the priors stated in the bounty rules: the page was unchanged from 23:48
 through the 04:00 read and refreshed by the 04:30 read (interval in
 (252, 282] minutes), the tracked count jumped 638 → 3,868, and the earners
-at that first unseen refresh grow by ×1.20 — calibrated so the house
-baseline's practice loss under the model's implied answers is ~1.51, the
-figure the rules state for it. A trophy already at 100% stays at 100%.
+at that first unseen refresh grow by ×1.20 at the centre of the
+[1.10, 1.20, 1.30] prior. The centre is pinned by the rules' own number:
+the rules state the house baseline scores about 1.51 on the practice, and
+that figure implies a first-refresh earners growth of about 1.20 (1.10
+would score about 1.61 for the baseline, 1.30 about 1.43), so the prior
+spans the range the rules allow. A trophy already at 100% stays at 100%.
 
 ## Validation (local scorer, pinball loss on the logit scale, per RULES.txt)
 
@@ -55,19 +67,37 @@ reproduces the rules' worked example exactly (0.403404), and the house
 baseline scores 1.52 against the derived answers, matching the rules'
 stated ~1.51 — so the derivation is consistent with the rules.
 
-| case | this entry | house baseline |
-| ---- | ---------- | -------------- |
-| p00  | 0.0315     | 1.52           |
-| p01  | 0.0315     | 1.52           |
-| mean | **0.0315** | 1.52           |
+| case | v2 | v1 | house baseline |
+| ---- | -- | -- | -------------- |
+| p00  | 0.0188 | 0.0315 | 1.52 |
+| p01  | 0.0188 | 0.0315 | 1.52 |
+| mean | **0.0188** | 0.0315 | 1.52 |
 
-The final's mechanism was also checked on two synthetic final-like cases
-(120 reads, 13 refreshes, 6,510-minute horizon, generated independently of
-this model): a world where players growth saturates by the deadline
-(0.143 vs the baseline's 0.256) and a world where it keeps growing
-(0.092 vs the baseline's 0.239). In both, the model beats the house
-baseline; the practice score is not the final's score, and the final
-depends on the refresh pattern the real history shows.
+The final's mechanism was also checked on five synthetic final-like cases
+(120 reads, 6,510-minute horizon, generators independent of this model):
+
+| world | v2 | v1 | house baseline |
+| ----- | -- | -- | -------------- |
+| saturating players | 0.078 | 0.143 | 0.256 |
+| strong dilution (P-curve) | 0.099 | 0.092 | 0.239 |
+| fast saturation + slow growth + decaying new-player earn rate | 0.104 | 0.091 | 0.299 |
+| lengthening refresh intervals | 0.126 | 0.126 | 0.319 |
+| sustained earners growth | 0.065 | 0.275 | 0.219 |
+| **mean** | **0.094** | 0.146 | 0.266 |
+| **worst** | **0.126** | 0.275 | 0.319 |
+
+V2 beats v1 on the practice mean and on the synthetic mean and worst
+case. Two of the five worlds get slightly worse than v1 (strong dilution
+0.099 vs 0.092, fast saturation 0.104 vs 0.091); the big gains are in the
+worlds where v1's growth extrapolation failed — sustained earners
+(0.065 vs 0.275) and saturating players (0.078 vs 0.143). The v1 report's
+"synth2" number (0.092) was in fact the strong-dilution world above; the
+original synth2 generator yields 5.8 billion tracked players at the
+checkpoint, which is physically impossible, so it is excluded from the
+mean (v2 scores 0.288 there vs v1's 0.316, baseline 0.338). The model
+beats the house baseline in every world tested; the practice score is not
+the final's score, and the final depends on the refresh pattern the real
+history shows.
 
 ## Run it
 

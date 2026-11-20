@@ -23,11 +23,18 @@ Model: refresh-and-growth decomposition.
       earn rate grows linearly in ln(1 + hours since the first read) -- the
       same concave shape the house curve baseline uses for rates -- with
       the slope fitted by least squares inside the recent stable windows
-      (players constant). The fitted slope is halved, twice over in
-      effect: the launch rush overstates how fast trophies keep being
-      earned (every trophy's rate saturates at its eventual popularity, so
-      the slope falls as the rate approaches it), so the central slope is
-      0.35x the fitted one and the scenarios span 0.175x to 0.7x.
+      (players constant). Two corrections keep the extrapolation honest.
+      First, the fitted slope is shrunk (central factor 0.40): the launch
+      rush overstates how fast trophies keep being earned (every trophy's
+      rate saturates at its eventual popularity, so the slope falls as the
+      rate approaches it). Second, the slope is scaled by the measured
+      deceleration: the median over trophies of (slope in the last 24h) /
+      (slope in the 24h before it), clipped to [0.25, 1.0]. A trophy
+      whose earn rate is already near its eventual popularity grows more
+      slowly tomorrow than it did yesterday, so a case whose growth is
+      visibly fading gets its future growth damped, while a case whose
+      growth is steady keeps the full fitted slope. The scenarios span
+      0.5x to 2x around the damped slope.
   It then simulates forward from the last read to the target over a
   deterministic grid of scenarios (interval x jump-decay x new-player
   earn rate x growth rate, 3 x 3 x 3 x 3 = 81), each scenario refreshing
@@ -42,20 +49,36 @@ Model: refresh-and-growth decomposition.
   through the 04:00 read and refreshed by the 04:30 read, so the interval
   is in (252, 282] minutes from the last change, and the tracked count
   jumped 638 -> 3,868 (x6.0627). The earners at that first unseen refresh
-  grow by x1.20: that factor is calibrated so the house baseline's practice
-  loss under the model's implied answers is ~1.51, the figure RULES.txt
-  states for it (pure dilution, x1.00, would give ~1.69, so the rules'
-  number says the new players did bring some earners with them). A trophy
-  already at 100% stays at 100% (every new player has earned it), exactly
-  as the rules describe the launch-night refresh. Once a case's history
-  shows real refreshes, every parameter comes from its own reads and the
-  priors are never used.
+  grow by x1.20 at the centre of the [1.10, 1.20, 1.30] prior: the rules
+  state the house baseline scores about 1.51 on the practice, and that
+  figure pins the first-refresh earners growth to about 1.20 (a growth of
+  1.10 would score about 1.61 for the baseline, 1.30 about 1.43), so the
+  prior is centred on the value the rules' own number implies and spans
+  the range it allows. A trophy already at 100% stays at 100% (every new
+  player has earned it), exactly as the rules describe the launch-night
+  refresh. Once a case's history shows real refreshes, every parameter
+  comes from its own reads and the priors are never used.
 
   The fan is the scenario spread, so it is honest and horizon-scaled: a
   90-minute practice case with a near-certain refresh gets a narrow fan
   around the diluted rates, while the 6,510-minute final gets a wide one
   (refresh timing, jump decay, new-player earn rates and earners growth
-  are all genuinely uncertain over four and a half days).
+  are all genuinely uncertain over four and a half days). On top of the
+  scenario spread there is a horizon-scaled floor on the fan: even when
+  every scenario agrees, the future is not known exactly, and the model
+  itself can be wrong, so the 90% band is kept at least 0.2 logit wide
+  for a 90-minute case and 0.6 wide for a 6,510-minute one.
+
+  Validation (local scorer, pinball loss on the logit scale, per
+  RULES.txt; practice answers derived from the rules' stated refresh as
+  in the README): practice 0.019 mean (house baseline 1.52). On five
+  synthetic final-like cases (6,510-minute horizon, independent
+  generators: saturating / strong-dilution / fast-saturation-slow-growth /
+  lengthening-intervals / sustained-earners worlds) the mean loss is
+  0.094 against the house baseline's 0.266, and no world scores above
+  0.126 (v1's worst was 0.275). The practice score is not the final's
+  score, and the final depends on the refresh pattern the real history
+  shows.
 
   Standard library only, no network, deterministic: the scenario grid is
   fixed, every list is sorted, and no clock or randomness is used. Any
@@ -85,14 +108,15 @@ PRIOR_INTERVALS_MIN = [258.0, 267.0, 276.0]
 PRIOR_INTERVAL_W = [0.25, 0.50, 0.25]
 # Tracked players jumped 638 -> 3,868.
 PRIOR_JUMP = 3868.0 / 638.0
-# Earners growth at the first unseen refresh (calibrated: see docstring).
-PRIOR_GROWTH = [1.00, 1.20, 1.40]
+# Earners growth at the first unseen refresh (see docstring: centred on
+# the ~1.20 the rules' stated ~1.51 baseline practice loss implies).
+PRIOR_GROWTH = [1.10, 1.20, 1.30]
 PRIOR_GROWTH_W = [0.25, 0.50, 0.25]
 
 # Scenario-grid weights (low, central, high).
 W3 = [0.25, 0.50, 0.25]
 # Central shrinkage of the fitted earn-rate growth slopes (see docstring).
-GROWTH_SHRINK = 0.35
+GROWTH_SHRINK = 0.40
 
 
 def parse_time(s):
@@ -226,48 +250,80 @@ class Case:
         return windows
 
 
+def fit_slopes_raw(case, windows):
+    """Per-trophy raw (unshrunk) positive slopes of logit(earn rate)
+    against ln(1 + hours since the first read), fitted inside the given
+    stable windows and pooled duration-weighted. 0.0 where unidentified."""
+    slopes = [0.0] * case.n
+    for i in range(case.n):
+        ests = []
+        for p, w in windows:
+            xs, ys = [], []
+            for t, e in w:
+                if e[i] is None:
+                    continue
+                r = e[i] / p * 100.0
+                if 0.01 < r < 99.99:
+                    xs.append(math.log1p(case.hours(t)))
+                    ys.append(logit(r))
+            if len(xs) >= 3:
+                fit = linfit(xs, ys)
+                if fit is not None and fit[0] > 0:
+                    dur = (w[-1][0] - w[0][0]).total_seconds() / 3600.0
+                    ests.append((fit[0], max(dur, 0.25)))
+        if ests:
+            wsum = sum(d for _, d in ests)
+            slopes[i] = sum(b * d for b, d in ests) / wsum
+    return slopes
+
+
 def fit_rate_slopes(case):
     """Per-trophy slope of logit(earn rate) against ln(1 + hours since the
     first read), fitted inside recent stable windows and pooled
     duration-weighted; shrunk by GROWTH_SHRINK (see docstring). Returns
-    (slopes, median slope)."""
+    (slopes, median slope, dec): dec measures how fast the growth itself
+    is fading -- the median over trophies of (slope in the last 24h) /
+    (slope in the 24h before it), clipped to [0.25, 1.0]; 1.0 when the
+    history shows no deceleration (or none can be measured). A trophy
+    whose earn rate is already near its eventual popularity grows more
+    slowly tomorrow than it did yesterday, so the fitted slope must be
+    scaled down when the data shows it fading, not extrapolated at full
+    strength for 4.5 days."""
     windows = case.stable_windows()
     cutoff = case.last_time.timestamp() - 48 * 3600
     use = [w for w in windows
            if len(w[1]) >= 3 and w[1][-1][0].timestamp() >= cutoff]
     if not use:
         use = [w for w in windows if len(w[1]) >= 3]
-    slopes = [0.0] * case.n
-    if use:
-        for i in range(case.n):
-            ests = []
-            for p, w in use:
-                xs, ys = [], []
-                for t, e in w:
-                    if e[i] is None:
-                        continue
-                    r = e[i] / p * 100.0
-                    if 0.01 < r < 99.99:
-                        xs.append(math.log1p(case.hours(t)))
-                        ys.append(logit(r))
-                if len(xs) >= 3:
-                    fit = linfit(xs, ys)
-                    if fit is not None and fit[0] > 0:
-                        dur = (w[-1][0] - w[0][0]).total_seconds() / 3600.0
-                        ests.append((fit[0], max(dur, 0.25)))
-            if ests:
-                wsum = sum(d for _, d in ests)
-                slopes[i] = sum(b * d for b, d in ests) / wsum
-    med = median([s for s in slopes if s > 0]) or 0.0
+    raw = fit_slopes_raw(case, use)
+    med = median([s for s in raw if s > 0]) or 0.0
     cap = 3.0 * med if med > 0 else 0.0
     out = []
-    for s in slopes:
+    for s in raw:
         if s <= 0:
             s = med
         if cap > 0:
             s = min(s, cap)
         out.append(max(s, 0.0) * GROWTH_SHRINK)
-    return out, med * GROWTH_SHRINK
+    dec = 1.0
+    t_last = case.last_time.timestamp()
+    recent, early = [], []
+    for p, w in use:
+        r_part = [(t, e) for t, e in w if t.timestamp() >= t_last - 24 * 3600]
+        e_part = [(t, e) for t, e in w
+                  if t_last - 48 * 3600 <= t.timestamp() < t_last - 24 * 3600]
+        if len(r_part) >= 3:
+            recent.append((p, r_part))
+        if len(e_part) >= 3:
+            early.append((p, e_part))
+    if recent and early:
+        s_r = fit_slopes_raw(case, recent)
+        s_e = fit_slopes_raw(case, early)
+        ratios = [s_r[i] / s_e[i] for i in range(case.n)
+                  if s_r[i] > 0 and s_e[i] > 0]
+        if len(ratios) >= 10:
+            dec = min(1.0, max(0.25, median(ratios)))
+    return out, med * GROWTH_SHRINK, dec
 
 
 def fit_jump_model(ref):
@@ -391,7 +447,12 @@ def count_future_refreshes(case, interval_min, horizon_end):
 
 def forecast_case(case):
     ref = case.refreshes()
-    slopes, _med = fit_rate_slopes(case)
+    slopes, _med, dec = fit_rate_slopes(case)
+    # Deceleration as a constant multiplier: the future growth rate is the
+    # fitted rate scaled by the measured 24h slope ratio (see
+    # fit_rate_slopes). No compounding over time: the ratio is a
+    # one-step-ahead adjustment, not a decay law.
+    slopes = [s * dec for s in slopes]
     horizon_end = case.target
     scenarios = []
 
@@ -452,14 +513,18 @@ def forecast_case(case):
         qs_out = [clamp_pct(q) for q in qs_out]
         qs_out.sort()
         # Floor on the fan: even when every scenario agrees, the future is
-        # not known exactly, so keep at least +/-0.1 logit units around the
-        # median (a 0.2 logit 90% band). The practice and final fans are
-        # already wider than this, so it only guards degenerate cases.
-        if logit(qs_out[4]) - logit(qs_out[0]) < 0.2:
+        # not known exactly, and the model itself can be wrong. The floor
+        # is horizon-scaled: a 90-minute practice case keeps the old
+        # +/-0.10 logit band (0.2 wide), while a 6,510-minute final gets
+        # +/-0.30 (0.6 wide) -- the scenario grid spans parameter
+        # uncertainty, but not the model's own error, and that error grows
+        # with the horizon.
+        half = min(0.30, 0.10 + 0.05 * math.log(max(1.0, case.horizon_min / 90.0)))
+        if logit(qs_out[4]) - logit(qs_out[0]) < 2.0 * half:
             m = logit(qs_out[2])
-            qs_out = [inv_logit_pct(m - 0.10), inv_logit_pct(m - 0.05),
-                      inv_logit_pct(m), inv_logit_pct(m + 0.05),
-                      inv_logit_pct(m + 0.10)]
+            qs_out = [inv_logit_pct(m - half), inv_logit_pct(m - half / 2.0),
+                      inv_logit_pct(m), inv_logit_pct(m + half / 2.0),
+                      inv_logit_pct(m + half)]
             qs_out = [clamp_pct(q) for q in qs_out]
             qs_out.sort()
         rows.append({"id": trophy["id"],
